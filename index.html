@@ -181,6 +181,12 @@
             // #region Event Listeners
 
             function onMouseDown(event) {
+
+                // return on right click
+                if (event.button == 2) {
+                    return;
+                }
+
                 // If the mouse is over a cohort line, do nothing. Let the line's click event handle it.
                 if (isOverLine) {
                     return;
@@ -499,7 +505,7 @@
             d3.select("#chart")
             .on("mousedown", onMouseDown)
             .on("mousemove", onMouseMove)
-            .on("mouseup", onMouseUp);
+            .on("mouseup", onMouseUp)
 
             // select any cohorts that were specified to be selected by default
             selectExistingCohortsByName(cohortNamesToSelectByDefault);
