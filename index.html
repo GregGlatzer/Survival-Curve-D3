@@ -1,0 +1,511 @@
+<head>
+    <title>Kaplan Meier Survival Curve</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <link rel="stylesheet" href="survival.component.css">
+</head>
+<body>
+    
+    <div class="container">
+        <svg id="chart"></svg>
+        <div>
+            <h4>Interactivity Tips</h4>
+            <p>- Hold down the shift key to select multiple lines</p>
+            <p>- Still holding shift, Click again to deselect</p>
+            <p>- Drag to select a region</p>
+            <div style="margin-top: 20px;"><b>Active Cohort(s)</b></div>
+            <div id="active-cohorts"></div>
+        </div>
+        <div id="tooltip"></div>
+    </div>
+    <script>
+        
+        const ALL_COLOR = "red"
+        const AXIS_LABEL_PADDING = 20;
+        const TITLE_PADDING = 20;
+        const MARGIN = { top: 20, right: 20, bottom: 30, left: 30 };
+        const WIDTH = 600;
+        const HEIGHT = 400;
+
+        // #region Global State Variables
+
+        // these may need to be state variables in the Angular component
+        let isDragging = false;
+        let isOverLine = false;
+        const selectedCohortSubsets = []; // { cohort: Cohort, points: { date, value }[] }[]
+        const selectedCohortNames = [];
+        const cohortLines = []
+        let artificallyHoldingShift = false;
+
+        // #endregion
+
+        // #region I/O to be replaced with Oncoscape calls
+
+        // these will be triggered from lifecycle events on Angular components like ngOnInit,
+        // As well as by other components and subscribed observables
+
+
+        /**
+         * Regardless of how the data looks coming in, we want to transform it to the following format:
+         * [
+         * {
+         *   name: "Cohort 1",
+         *   color: "red",
+         *   values: [
+         *     { date: 0, value: 1 },
+         *      ...
+         *  ]
+         * },
+         * ...
+         * ] 
+         */
+        function loadData(filepath = "survival-widget-data.json", cohortNamesToSelectByDefault = ['All']) {
+            return new Promise((resolve, reject) => {
+                d3.json(filepath).then(function(data) {
+
+                    let XIsYears = false;
+                    data = data.map(cohortData => {
+                        const { transformed, values } = transformCohortXValuesToYear(cohortData.values);
+                        if (transformed) {
+                            XIsYears = true;
+                        }
+                        const color = cohortData.name == "All" ? ALL_COLOR : cohortData.sourceCohort.assignedColor;
+                        return {
+                            name: cohortData.name,
+                            color: color,
+                            values: values
+                        }
+                    });
+
+                    resolve({
+                        data,
+                        XIsYears,
+                        cohortNamesToSelectByDefault
+                    });
+                });
+            });
+        }
+
+        // Called by things like Oncoscape legend clicks
+        function selectExistingCohortsByName(cohortNames) {
+            clearSelection();
+
+            artificallyHoldingShift = true;
+
+            cohortNames.forEach(name => {
+                d3.select(`.cohort-line[name="${name}"]`)
+                .attr("stroke-width", 4)
+                .dispatch('click')
+            });
+
+            artificallyHoldingShift = false;
+
+            // the click events will set this to true, but we never really interacted with the lines with the mouse
+            isOverLine = false;
+        }
+
+        // This will eventually be replaced with an Oncoscape call instead of the current html page updates
+        function emitSelectionUpdate() {
+            // emit the selected cohorts to other elements on the page
+            const cohortNames = [
+                ...selectedCohortNames,
+            ]
+
+            if (selectedCohortSubsets.length > 0) {
+                const numCohorts = selectedCohortSubsets.length;
+                const numSamples = selectedCohortSubsets.reduce((acc, curr) => acc + curr.points.length, 0);
+                cohortNames.push(`Selected Subset (${numSamples} samples from ${selectedCohortSubsets.length} existing cohorts)`);
+            }
+            d3.select("#active-cohorts").html(cohortNames.map(n => `- ${n}`).join("<br>"));
+        }
+
+        // #endregion
+
+        // #region Helper Functions
+
+        function transformCohortXValuesToYear(cohortValues, pcntNeededAboveAYear = 0.3) {
+            // if more than a given % of the data has a "date" value greater than 365, then divide all date values by 365 to get years
+            const pcntGreaterThanAYear = cohortValues.filter(d => d.date > 365).length / cohortValues.length;
+            if (pcntGreaterThanAYear > pcntNeededAboveAYear) {
+                return {
+                    transformed: true, 
+                    values: cohortValues.map(d => ({ date: d.date / 365, value: d.value }))
+                };
+            } else {
+                return {
+                    transformed: false,
+                    values: cohortValues
+                };
+            }
+        }
+
+        function clearSelection() {
+            // remove thick lines from dragging rect selection
+            d3.selectAll(".selected-subset-line").remove();
+
+            // clear out the selected cohort subsets
+            selectedCohortSubsets.length = 0;
+            selectedCohortNames.length = 0;
+
+            // reset the cohort lines to their original width
+            cohortLines.forEach(line => line.attr("stroke-width", 2));
+
+            // hide the tooltip
+            d3.select("#tooltip").style("display", "none");
+
+            // emit the new cleared selection so other elements on the page can respond
+            emitSelectionUpdate();
+        }
+
+        /**
+         *  Returns true if the given point is within the given rectangle
+         * @param { { x: number, y: number } } point
+         * @param { { x: number, y: number }[] } rectPoints
+         */
+        function pointInRect(point, rectPoints) {
+            const x = point.x;
+            const y = point.y;
+            const x1 = Math.min(rectPoints[0].x, rectPoints[1].x);
+            const x2 = Math.max(rectPoints[0].x, rectPoints[1].x);
+            const y1 = Math.min(rectPoints[0].y, rectPoints[1].y);
+            const y2 = Math.max(rectPoints[0].y, rectPoints[1].y);
+
+            return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+        }
+
+        // #endregion
+        
+        // #region Main
+
+        loadData().then(function({ data, XIsYears, cohortNamesToSelectByDefault }) {
+
+            // #region Event Listeners
+
+            function onMouseDown(event) {
+                // If the mouse is over a cohort line, do nothing. Let the line's click event handle it.
+                if (isOverLine) {
+                    return;
+                }
+                
+                const shiftKeyPressed = event.shiftKey || artificallyHoldingShift;
+                if (!shiftKeyPressed) {
+                    // if shift is not pressed, clear the selection
+                    clearSelection();
+                }
+
+                isDragging = true;
+                startX = event.clientX;
+                startY = event.clientY;
+
+                rectangle = d3.select("#chart")
+                .append("rect")
+                .attr("class", "drag-rectangle")
+                .attr("x", startX)
+                .attr("y", startY)
+                .attr("width", 0)
+                .attr("height", 0)
+                .attr("fill", "lightblue")
+                .attr("opacity", 0.2);
+
+                // add hint text at the starting point of the rectangle
+                d3.select("#chart").append("text")
+                    .attr("class", "drag-rectangle-text")
+                    .attr("x", startX)
+                    .attr("y", startY)
+                    .attr("fill", "#455ca3")
+                    .attr("font-size", "12px")
+                    .attr("font-weight", "bold")
+                    .text("Select for cohort creation")
+                    // transition from transparent to opaque
+                    .transition()
+                    .duration(500)
+                    .attr("opacity", 1);
+            }
+
+            function onMouseMove(event) {
+                if (isDragging) {
+                    const current = {
+                        x: event.clientX,
+                        y: event.clientY
+                    }
+                    const start = {
+                        x: startX,
+                        y: startY
+                    }   
+
+                    // Update position based on the direction
+                    const rectX = current.x < start.x ? current.x : start.x;
+                    const rectY = current.y < start.y ? current.y : start.y; 
+
+                    // convert the mouse coordinates to data domain coordinates
+                    const domainStartCoords = {
+                        x: x.invert(start.x - MARGIN.left - AXIS_LABEL_PADDING),
+                        y: y.invert(start.y - MARGIN.top - TITLE_PADDING)
+                    }
+                    const domainCurrentCoords = {
+                        x: x.invert(current.x - MARGIN.left - AXIS_LABEL_PADDING),
+                        y: y.invert(current.y - MARGIN.top - TITLE_PADDING)
+                    }
+
+                    // update the rectangle
+                    rectangle.attr("x", rectX)
+                        .attr("y", rectY)
+                        .attr("width", Math.abs(current.x - start.x))
+                        .attr("height", Math.abs(current.y - start.y));
+
+                    // clear out any existing lines
+                    d3.selectAll(".selected-subset-line").remove();
+
+                    // find the points in each cohort that are within the rectangle
+                    data.forEach(cohort => {
+                        const values = cohort.values;
+                        const pointsInRect = values.filter(d => pointInRect({ x: d.date, y: d.value }, [domainStartCoords, domainCurrentCoords]));
+                        if (pointsInRect.length == 0) {
+                            return;
+                        }
+                        let foundExistingSubsetForThisCohort = false;
+                        selectedCohortSubsets.forEach((subset, i) => {
+                            if (foundExistingSubsetForThisCohort) {
+                                return;
+                            }
+                            if (subset.cohort.name == cohort.name) {
+                                // add the new points to the existing selected points
+                                selectedCohortSubsets[i].points = [...selectedCohortSubsets[i].points, ...pointsInRect];
+                                foundExistingSubsetForThisCohort = true;
+                            }
+                        });
+
+                        if (!foundExistingSubsetForThisCohort) {
+                            selectedCohortSubsets.push({
+                                cohort,
+                                points: pointsInRect
+                            });
+                        }
+
+                        console.log(selectedCohortSubsets)
+                        
+
+                        // draw a line between the points in the cohort
+                        const line = d3.line()
+                            .x(d => x(d.date))
+                            .y(d => y(d.value));
+
+
+                        const path = svg.append("path")
+                            .datum(pointsInRect)
+                            .attr("fill", "none")
+                            .attr("stroke", cohort.color)
+                            .attr("stroke-width", 4)
+                            .attr("d", line)
+                            .attr("class", "selected-subset-line");
+                    });
+                }
+            }
+
+            function onMouseUp() {
+                isDragging = false;
+                d3.select(".drag-rectangle-text").remove()
+                if (rectangle) {
+                    rectangle.remove();
+                }
+                emitSelectionUpdate();
+            }
+
+            function onLineClick(line, cohort) {
+
+                const shiftPressed = event.shiftKey || artificallyHoldingShift;
+                const somethingIsSelected = selectedCohortNames.length > 0 || selectedCohortSubsets.length > 0;
+                if (somethingIsSelected) {
+                    if (shiftPressed) {
+                        // shift is pressed and something else is already selected
+                        const thisLineAlreadySelected = selectedCohortNames.includes(cohort.name);
+                        if (thisLineAlreadySelected) {
+                            // the line is already selected with shift pressed
+                            // Expected behavior is to remove this cohort from the selection
+                            selectedCohortNames.splice(selectedCohortNames.indexOf(cohort.name), 1);
+                            onLineMouseOut(cohort);
+                            emitSelectionUpdate();
+                            return
+                        } else {
+                            // the line is not already selected with shift pressed
+                            // Expected behavior is to add this cohort to the selection
+                            selectedCohortNames.push(cohort.name);
+                            onLineMouseOver(cohort);
+                            emitSelectionUpdate();
+                            return;
+                        }
+
+                    } else {
+                        // shift is not pressed and something else is already selected.
+                        // Expected behavior is to clear the selection and select this cohort
+                        clearSelection();
+                        // put this cohort line back in focus
+                        onLineMouseOver(cohort);
+                        selectedCohortNames.push(cohort.name);
+                        emitSelectionUpdate();
+                        return;
+                    }
+                }
+
+                selectedCohortNames.push(cohort.name);
+                emitSelectionUpdate();
+            }
+
+            function onLineMouseOut(cohort) {
+                isOverLine = false;
+                d3.select("#tooltip").style("display", "none");
+                if (selectedCohortNames.includes(cohort.name)) {
+                    return;
+                }
+                d3.select(`.cohort-line[name="${cohort.name}"]`).attr("stroke-width", 2);
+            }
+
+            function onLineMouseOver(cohort) {
+                isOverLine = true;
+                if (isDragging) {
+                    return;
+                }
+                d3.select(`.cohort-line[name="${cohort.name}"]`).attr("stroke-width", 4);
+                d3.select("#tooltip")
+                    .style("display", "block")
+                    .style("left", (event.pageX + 10) + "px")
+                    .style("top", (event.pageY + 10) + "px")
+                    .html(`<b>Cohort:</b> ${cohort.name}`)
+            }
+
+            // #endregion
+
+            const svg = d3.select("#chart")
+                .attr("width", WIDTH + MARGIN.left + MARGIN.right + AXIS_LABEL_PADDING)
+                .attr("height", HEIGHT + MARGIN.top + MARGIN.bottom + TITLE_PADDING + AXIS_LABEL_PADDING)
+                .append("g")
+                .attr("transform", `translate(${MARGIN.left + AXIS_LABEL_PADDING}, ${MARGIN.top + TITLE_PADDING})`);
+
+            const allValues = data.flatMap(entry => entry.values);
+            const x = d3.scaleLinear()
+                .domain([0, d3.max(allValues, d => d.date)])
+                .range([0, WIDTH]);
+
+            const y = d3.scaleLinear()
+                .domain([0, d3.max(allValues, d => d.value)])
+                .range([HEIGHT, 0]);
+
+            const line = d3.line()
+                .x(d => x(d.date))
+                .y(d => y(d.value));
+
+            // for each cohort in data, draw a line
+            data.forEach(cohort => {
+                const values = cohort.values;
+                const cohortName = cohort.name;
+                const cohortLine = svg.append("path")
+                    .datum(values)
+                    .attr("class", "cohort-line")
+                    .attr("name", cohortName)
+                    .attr("fill", "none")
+                    .attr("stroke", cohort.color)
+                    .attr("stroke-width", 2)
+                    .attr("d", line);
+
+                cohortLine.on("mouseover", () => onLineMouseOver(cohort));
+                cohortLine.on("mouseout", () => onLineMouseOut(cohort));
+                cohortLine.on("click", () => onLineClick(cohortLine, cohort));
+
+                cohortLines.push(cohortLine)
+            });
+
+            // Add x-axis label
+            svg.append("text")
+                .attr("class", "x-axis-label")
+                .attr("x", WIDTH / 2)
+                .attr("y", HEIGHT + MARGIN.bottom)
+                .attr("text-anchor", "middle")
+                .text(`Time (${XIsYears ? "Years" : "Days"})`)
+                .style("font-weight", "bold")
+
+            // Add y-axis label
+            svg.append("text")
+                .attr("class", "y-axis-label")
+                .attr("transform", "rotate(-90)")
+                .attr("x", -HEIGHT / 2)
+                .attr("y", -MARGIN.left)
+                .attr("text-anchor", "middle")
+                .text("% Surviving")
+                .style("font-weight", "bold")
+
+            // Add x-axis spine
+            svg.append("line")
+                .attr("class", "x-axis-spine")
+                .attr("x1", 0)
+                .attr("y1", HEIGHT)
+                .attr("x2", WIDTH)
+                .attr("y2", HEIGHT)
+                .attr("stroke", "black")
+                .attr("stroke-width", 1);
+
+            // Add y-axis spine
+            svg.append("line")
+                .attr("class", "y-axis-spine")
+                .attr("x1", 0)
+                .attr("y1", 0)
+                .attr("x2", 0)
+                .attr("y2", HEIGHT)
+                .attr("stroke", "black")
+                .attr("stroke-width", 1);
+
+            // Add dashed grey horizontal lines for every 20% on the y-axis
+            for (let i = 20; i <= 100; i += 20) {
+                const yValue = y((i / 100) * d3.max(allValues, d => d.value));
+                svg.append("line")
+                    .attr("class", "y-axis-line")
+                    .attr("x1", 0)
+                    .attr("y1", yValue)
+                    .attr("x2", WIDTH)
+                    .attr("y2", yValue)
+                    .attr("stroke", "grey")
+                    .attr("stroke-width", 1)
+                    .attr("stroke-dasharray", "5,5");
+            }
+
+
+            // Add a title
+            svg.append("text")
+                .attr("class", "title")
+                .attr("x", WIDTH / 2)
+                .attr("y", -MARGIN.top)
+                .attr("text-anchor", "middle")
+                .text("Kaplan Meier Survival Curve")
+                .style("font-weight", "bold")
+                .style("font-size", "20px")
+
+
+            // Add x-axis ticks
+            const xAxis = d3.axisBottom(x);
+            svg.append("g")
+                .attr("class", "x-axis")
+                .attr("transform", `translate(0, ${HEIGHT})`)
+                .call(xAxis);
+
+            // Add y-axis ticks
+            const yAxis = d3.axisLeft(y);
+            svg.append("g")
+                .attr("class", "y-axis")
+                .call(yAxis);
+
+            
+            let startX = 0;
+            let rectangle;
+
+            // Add event listeners to the whole chart for selection
+            d3.select("#chart")
+            .on("mousedown", onMouseDown)
+            .on("mousemove", onMouseMove)
+            .on("mouseup", onMouseUp);
+
+            // select any cohorts that were specified to be selected by default
+            selectExistingCohortsByName(cohortNamesToSelectByDefault);
+        })
+
+        // #endregion
+    </script>
+</body>
+</html>
